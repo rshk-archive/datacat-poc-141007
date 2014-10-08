@@ -37,7 +37,7 @@ def create_tables(conn):
     # ------------------------------------------------------------
 
     with conn.cursor() as cur:
-        for table in ALL_TABLES:
+        for table_name, table in ALL_TABLES.iteritems():
             cur.execute(table.get_create_sql())
 
 
@@ -46,7 +46,7 @@ def drop_tables(conn):
         raise ValueError("Was expecting a connection with autocommit on")
 
     with conn.cursor() as cur:
-        for table in reversed(ALL_TABLES):
+        for table_name, table in reversed(list(ALL_TABLES.iteritems())):
             cur.execute(table.get_drop_sql())
 
 

@@ -3,16 +3,17 @@ Core functionality for datacat.
 Mostly wrappers around database queries, etc.
 """
 
+import hashlib
 import json
 from datetime import datetime
 
+from flask import g, current_app
 from flask.config import Config
+from werkzeug import LocalProxy
+from werkzeug.exceptions import NotFound
 
 from datacat.db import querybuilder, connect, create_tables, drop_tables
-
-
-class NotFound(Exception):
-    pass
+from datacat.utils.files import file_read_chunks
 
 
 class DatacatCore(object):
@@ -40,6 +41,106 @@ class DatacatCore(object):
 
     def drop_tables(self):
         drop_tables(self.admin_db)
+
+    # ------------------------------------------------------------
+    # Resource data CRUD
+    # ------------------------------------------------------------
+
+    def resource_data_iter(self):
+        """Iterate over resource attributes"""
+
+        with self.db, self.db.cursor() as cur:
+            cur.execute("SELECT * FROM resource_data")
+            for row in cur.fetchall():
+                yield row
+
+    def resource_data_create(self, stream, metadata=None, mimetype=None):
+        """Create resource data from a stream"""
+
+        resource_hash = hashlib.sha1()
+        with self.db, self.db.cursor() as cur:
+            lobj = self.db.lobject(oid=0, mode='wb')
+            oid = lobj.oid
+            for chunk in file_read_chunks(stream):
+                lobj.write(chunk)
+                resource_hash.update(chunk)
+            lobj.close()
+
+            data = {
+                'ctime': datetime.now(),
+                'mtime': datetime.now(),
+                'metadata': json.dumps(metadata),
+                'mimetype': mimetype or 'application/octet-stream',
+                'data_oid': oid,
+                'hash': 'sha1:{0}'.format(resource_hash.hexdigest()),
+            }
+
+            query = querybuilder.insert('resource_data', data)
+            cur.execute(query, data)
+            resource_data_id = cur.fetchone()[0]
+
+        return resource_data_id
+
+    def resource_data_get_info(self, objid):
+        query = querybuilder.select_pk('resource_data')
+        with self.db, self.db.cursor() as cur:
+            cur.execute(query, {'id': objid})
+            return cur.fetchone()
+
+    def resource_data_read(self, objid):
+        resource = self.resource_data_get_info(objid)
+        with self.db:
+            lobj = self.db.lobject(oid=resource['data_oid'], mode='rb')
+            return lobj.read()
+
+    def resource_data_copy(self, objid, dest):
+        resource = self.resource_data_get_info(objid)
+        with self.db:
+            lobj = self.db.lobject(oid=resource['data_oid'], mode='rb')
+            for chunk in file_read_chunks(lobj):
+                dest.write(chunk)
+
+    def resource_data_update(self, objid, stream=None, metadata=None,
+                             mimetype=None):
+
+        # Get the original object, to check for its existence
+        # and to get the oid of the lobject holding the data.
+        original = self.resource_data_get_info(objid)
+
+        data = {
+            'id': objid,
+            'mtime': datetime.now(),
+        }
+
+        if metadata is not None:
+            data['metadata'] = json.dumps(metadata)
+        if mimetype is not None:
+            data['mimetype'] = mimetype
+
+        with self.db, self.db.cursor() as cur:
+            if stream is not None:
+                # Update the lobject with data from the stream
+                resource_hash = hashlib.sha1()
+                lobj = self.db.lobject(oid=original['data_oid'], mode='wb')
+                for chunk in file_read_chunks(stream):
+                    lobj.write(chunk)
+                    resource_hash.update(chunk)
+                lobj.close()
+                data['hash'] = 'sha1:{0}'.format(resource_hash.hexdigest())
+
+            query = querybuilder.update('resource_data', data)
+            cur.execute(query, data)
+
+    def resource_data_remove(self, objid):
+        # We need the OID to remove the lobject
+        original = self.resource_data_get_info(objid)
+
+        with self.db, self.db.cursor() as cur:
+            lobject = db.lobject(oid=resource['data_oid'], mode='rb')
+            data = lobject.read()
+            lobject.close()
+
+            cur.execute(querybuilder.delete('resource_data'), {'id': objid})
 
     # ------------------------------------------------------------
     # Dataset / resource CRUD
@@ -160,3 +261,15 @@ class DatacatCore(object):
         query = querybuilder.delete(name)
         with self.db, self.db.cursor() as cur:
             cur.execute(query, dict(id=obj_id))
+
+
+def get_current_datacat():
+    """Get the "current" instance of the datacat app"""
+
+    datacat = getattr(g, '_datacat', None)
+    if datacat is None:
+        datacat = g._datacat = DatacatCore(current_app.config)
+    return datacat
+
+
+datacat_core = LocalProxy(get_current_datacat)
